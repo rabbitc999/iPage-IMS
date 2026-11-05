@@ -61,7 +61,16 @@ final class QueryValues {
                 return Double.valueOf(value);
             }
             if (type == Boolean.class || type == boolean.class) {
-                return Boolean.valueOf(value);
+                // 表单/手工请求可能传「是/否」，直接 Boolean.valueOf("是") 会静默变成 false。
+                if (value.equals("是") || value.equals("启用") || value.equals("1")
+                        || value.equalsIgnoreCase("true") || value.equalsIgnoreCase("enabled")) {
+                    return true;
+                }
+                if (value.equals("否") || value.equals("停用") || value.equals("0")
+                        || value.equalsIgnoreCase("false") || value.equalsIgnoreCase("disabled")) {
+                    return false;
+                }
+                throw new IllegalArgumentException("布尔值只能是 是/否、true/false 或 1/0");
             }
             if (type == LocalDate.class) {
                 return LocalDate.parse(value);

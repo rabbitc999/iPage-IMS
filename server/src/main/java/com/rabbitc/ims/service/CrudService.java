@@ -34,6 +34,7 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -454,16 +455,57 @@ public class CrudService {
             return;
         }
         String pattern = "%" + kw.trim() + "%";
+        String needle = kw.trim().toLowerCase(Locale.ROOT);
         Dialect dialect = sql.dialect();
         Set<Object> ids = new LinkedHashSet<>();
         for (FieldDescriptor field : meta.fields()) {
-            if (field.type() != FieldType.STRING || !field.visible() || !field.lookPermission().granted(user.level())) {
+            if (!field.visible() || !field.lookPermission().granted(user.level())) {
                 continue;
             }
-            String statement = "SELECT " + dialect.quote(meta.idColumn())
-                               + " FROM " + dialect.quote(sql.tableName(meta.modelClass()))
-                               + " WHERE " + dialect.quote(field.column()) + " LIKE ?";
-            ids.addAll(sql.query(new SqlStatement(statement, List.of(pattern)), rs -> rs.getObject(1)));
+            if (field.type() == FieldType.STRING) {
+                // PostgreSQL 的 LIKE 区分大小写，MySQL 默认排序规则通常不区分。
+                // 关键字搜索统一用 LOWER() 比较，避免同一个关键字在不同数据库上得到「空结果」。
+                String statement = "SELECT " + dialect.quote(meta.idColumn())
+                                   + " FROM " + dialect.quote(sql.tableName(meta.modelClass()))
+                                   + " WHERE LOWER(" + dialect.quote(field.column()) + ") LIKE LOWER(?)";
+                ids.addAll(sql.query(new SqlStatement(statement, List.of(pattern)), rs -> rs.getObject(1)));
+            } else if (field.type() == FieldType.ASSOCIATION_ID && field.relatedClass() != null) {
+                // 外键列存的是 UUID，关键字通常是关联记录的显示名称（如「张三」）。
+                // 先在关联选项里匹配名称，再把命中的外键转成本模型的主键。
+                List<String> related = new ArrayList<>();
+                for (Map.Entry<String, String> option : associations.options(user, meta.modelClass(), field).entrySet()) {
+                    String label = option.getValue() == null ? "" : option.getValue();
+                    if (label.toLowerCase(Locale.ROOT).contains(needle)) {
+                        related.add(option.getKey());
+                    }
+                }
+                if (!related.isEmpty()) {
+                    addIdsByColumnValue(meta, field, related, ids);
+                }
+            } else if (field.type() == FieldType.ENUM && field.enumClass() != null) {
+                // 枚举列存的是常量名（OPEN），用户搜的是中文标签（待处理）。
+                // 常量名与标签任一命中都算匹配，这样「待处理」「OPEN」「处理」都能搜到。
+                List<String> matched = new ArrayList<>();
+                for (Map.Entry<String, String> option : ModelMeta.enumOptions(field).entrySet()) {
+                    String label = option.getValue() == null ? "" : option.getValue();
+                    if (option.getKey().toLowerCase(Locale.ROOT).contains(needle)
+                            || label.toLowerCase(Locale.ROOT).contains(needle)) {
+                        matched.add(option.getKey());
+                    }
+                }
+                if (!matched.isEmpty()) {
+                    addIdsByColumnValue(meta, field, matched, ids);
+                }
+            } else if (field.type() == FieldType.NUMBER || field.type() == FieldType.DATE) {
+                // 数字、日期在库里是原生类型，不能直接 LIKE。
+                // 先按方言 CAST 成文本，再用同样的 LOWER(...) LIKE 匹配：
+                // 金额「123.45」、日期「2026-11-05」、年份「2026」都能搜到。
+                String expression = dialect.textCast(dialect.quote(field.column()));
+                String statement = "SELECT " + dialect.quote(meta.idColumn())
+                                   + " FROM " + dialect.quote(sql.tableName(meta.modelClass()))
+                                   + " WHERE LOWER(" + expression + ") LIKE LOWER(?)";
+                ids.addAll(sql.query(new SqlStatement(statement, List.of(pattern)), rs -> rs.getObject(1)));
+            }
             if (ids.size() >= KEYWORD_LIMIT) {
                 break;
             }
@@ -477,6 +519,59 @@ public class CrudService {
         query.in(meta.idField().name(), new ArrayList<>(ids));
     }
 
+    /**
+     * 按列值集合反查本模型主键。
+     * <p>
+     * 服务于两类关键字匹配：外键列（用户搜的是关联记录的显示名，如「张三」）
+     * 和枚举列（用户搜的是中文标签「待处理」，库里存的是常量名 {@code OPEN}）。
+     * 标识符来自模型元数据并按方言加引号，值仍走占位符，不拼字符串。
+     */
+    private void addIdsByColumnValue(ModelMeta meta, FieldDescriptor field, List<String> values, Set<Object> ids) {
+        if (values.isEmpty()) {
+            return;
+        }
+        Dialect dialect = sql.dialect();
+        StringBuilder statement = new StringBuilder("SELECT ")
+                .append(dialect.quote(meta.idColumn()))
+                .append(" FROM ").append(dialect.quote(sql.tableName(meta.modelClass())))
+                .append(" WHERE ").append(dialect.quote(field.column())).append(" IN (");
+        List<Object> parameters = new ArrayList<>(values.size());
+        for (int i = 0; i < values.size(); i++) {
+            if (i > 0) {
+                statement.append(", ");
+            }
+            statement.append('?');
+            parameters.add(values.get(i));
+        }
+        statement.append(')');
+        ids.addAll(sql.query(new SqlStatement(statement.toString(), parameters), rs -> rs.getObject(1)));
+    }
+
+    /**
+     * 枚举筛选值兼容两种写法：常量名（{@code OPEN}）与中文标签（{@code 待处理}）。
+     * <p>
+     * 前端下拉传常量名；手工请求、脚本或 AI 调用更可能直接给中文标签，
+     * 这里统一归一成常量名再交给查询层，避免「明明有这个状态却筛不出东西」。
+     */
+    private static String enumValue(FieldDescriptor field, String raw) {
+        if (raw == null || raw.isBlank() || field.enumClass() == null) {
+            return raw;
+        }
+        String value = raw.trim();
+        for (Object constant : field.enumClass().getEnumConstants()) {
+            String name = ((Enum<?>) constant).name();
+            if (name.equalsIgnoreCase(value)) {
+                return name;
+            }
+        }
+        for (Map.Entry<String, String> option : ModelMeta.enumOptions(field).entrySet()) {
+            if (option.getValue() != null && option.getValue().equalsIgnoreCase(value)) {
+                return option.getKey();
+            }
+        }
+        return value;
+    }
+
     private void applyFilters(LoginUser user, ModelMeta meta, Query<?> query, Map<String, String> params) {
         for (FieldDescriptor field : meta.fields()) {
             if (!field.isColumn() || !field.visible() || !field.lookPermission().granted(user.level())) {
@@ -487,9 +582,107 @@ public class CrudService {
             if (operator.needsValue() && (raw == null || raw.isBlank())) {
                 continue;
             }
+            if (field.type() == FieldType.ASSOCIATION_ID
+                    && field.relatedClass() != null
+                    && isTextOperator(operator)) {
+                // 外键列里存的是 UUID，用户输入的是关联记录的显示名称。
+                // 先按显示名称解析出候选主键，再让主查询用 IN 过滤；否则
+                // `assignee_id LIKE '%张三%'` 永远匹配不到任何行。
+                applyAssociationFilter(user, meta, field, operator, query, raw);
+                continue;
+            }
+            if (field.type() == FieldType.ENUM && isFuzzyOperator(operator)) {
+                // 枚举列存的是常量名，模糊筛选也要先按中文标签/常量名解析。
+                applyEnumFilter(field, operator, query, raw);
+                continue;
+            }
+            if (isFuzzyOperator(operator) && field.type() != FieldType.STRING) {
+                // 日期、数字、布尔不能直接 LIKE；在进 SQL 前给出明确的 400，
+                // 而不是让 PostgreSQL 抛「函数 lower(date) 不存在」变成 500。
+                throw ApiException.badRequest("字段「" + field.text() + "」不支持模糊筛选，请使用等于、大于、小于等条件");
+            }
+            raw = enumValue(field, raw);
             Object value = operator.needsValue() ? QueryValues.convert(field, raw) : null;
             query.where(field.name(), operator, value);
         }
+    }
+
+    /** 关联字段支持按「显示名称」过滤；大小比较对 UUID 没有业务意义，仍走普通列条件。 */
+    private static boolean isTextOperator(OperatorType operator) {
+        return operator == OperatorType.LIKE
+                || operator == OperatorType.STARTS_WITH
+                || operator == OperatorType.ENDS_WITH
+                || operator == OperatorType.EQ
+                || operator == OperatorType.NE;
+    }
+
+    /** 只有这三种操作符需要把列转成文本做匹配。 */
+    private static boolean isFuzzyOperator(OperatorType operator) {
+        return operator == OperatorType.LIKE
+                || operator == OperatorType.STARTS_WITH
+                || operator == OperatorType.ENDS_WITH;
+    }
+
+    /**
+     * 枚举列按中文标签或常量名做模糊筛选。
+     * <p>
+     * 例如状态选「包含 答辩」：库里存的是 {@code DEFENDED}，直接 LIKE 永远不命中。
+     * 先把标签匹配成常量名集合，再用 {@code status IN (...)} 过滤。
+     */
+    private void applyEnumFilter(FieldDescriptor field, OperatorType operator, Query<?> query, String raw) {
+        String needle = raw.trim();
+        List<String> matched = new ArrayList<>();
+        for (Map.Entry<String, String> option : ModelMeta.enumOptions(field).entrySet()) {
+            if (matchesAssociation(option.getKey(), option.getValue(), operator, needle)) {
+                matched.add(option.getKey());
+            }
+        }
+        if (matched.isEmpty()) {
+            query.where(field.name(), OperatorType.IN, List.of(Ids.NO_MATCH));
+            return;
+        }
+        query.where(field.name(), operator == OperatorType.NE ? OperatorType.NOT_IN : OperatorType.IN,
+                matched);
+    }
+
+    /**
+     * 把「关联记录的显示名称 / 主键」解析成外键候选值。
+     * <p>
+     * 例如工单列表按「处理人 = 张三」筛选：{@code assignee_id} 列里没有姓名，
+     * 只有用户主键。这里通过关联选项拿到 {@code 主键 -> 显示文本}，先做名称匹配，
+     * 再用 {@code assignee_id IN (...)} 过滤工单。
+     */
+    private void applyAssociationFilter(LoginUser user, ModelMeta meta, FieldDescriptor field,
+                                        OperatorType operator, Query<?> query, String raw) {
+        String needle = raw.trim();
+        Map<String, String> options = associations.options(user, meta.modelClass(), field);
+        List<String> matched = new ArrayList<>();
+        for (Map.Entry<String, String> option : options.entrySet()) {
+            if (matchesAssociation(option.getKey(), option.getValue(), operator, needle)) {
+                matched.add(option.getKey());
+            }
+        }
+        if (matched.isEmpty()) {
+            // 与关键字搜索一致：用哨兵值保证「匹配不到」时是空集，而不是退化成全表。
+            query.where(field.name(), OperatorType.IN, List.of(Ids.NO_MATCH));
+            return;
+        }
+        query.where(field.name(), operator == OperatorType.NE ? OperatorType.NOT_IN : OperatorType.IN,
+                matched);
+    }
+
+    private static boolean matchesAssociation(String id, String label, OperatorType operator, String needle) {
+        String text = label == null ? "" : label;
+        String lower = needle.toLowerCase(Locale.ROOT);
+        return switch (operator) {
+            case EQ, NE -> text.equalsIgnoreCase(needle) || id.equalsIgnoreCase(needle);
+            case STARTS_WITH -> text.toLowerCase(Locale.ROOT).startsWith(lower)
+                    || id.toLowerCase(Locale.ROOT).startsWith(lower);
+            case ENDS_WITH -> text.toLowerCase(Locale.ROOT).endsWith(lower)
+                    || id.toLowerCase(Locale.ROOT).endsWith(lower);
+            default -> text.toLowerCase(Locale.ROOT).contains(lower)
+                    || id.toLowerCase(Locale.ROOT).contains(lower);
+        };
     }
 
     private void applySort(LoginUser user, ModelMeta meta, Query<?> query, String sort, String order) {

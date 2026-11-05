@@ -129,6 +129,20 @@ public interface Dialect {
     }
 
     /**
+     * 把数值、日期等非字符串列转成文本，供关键字搜索做包含匹配。
+     * <p>
+     * 默认用 {@code CONCAT('', 列)}：MySQL / H2 的 {@code CAST(... AS CHAR)}
+     * 默认是 {@code CHAR(1)}，会截断；而 {@code CONCAT} 在三套目标数据库里都能
+     * 把数字、日期转成完整文本。PostgreSQL 覆写为更明确的 {@code CAST(... AS TEXT)}。
+     *
+     * @param expression 列表达式（已按方言加引号）
+     * @return 可参与 {@code LIKE} 的文本表达式
+     */
+    default String textCast(String expression) {
+        return "CONCAT('', " + expression + ")";
+    }
+
+    /**
      * 是否支持在一条语句里用 {@code CREATE TABLE IF NOT EXISTS}。
      *
      * @return 支持返回 {@code true}

@@ -2,6 +2,7 @@
 package com.rabbitc.ipage.sql;
 
 import com.rabbitc.ipage.dialect.Dialect;
+import com.rabbitc.ipage.enums.OperatorType;
 import com.rabbitc.ipage.reflect.ModelMeta;
 import com.rabbitc.ipage.reflect.FieldDescriptor;
 import com.rabbitc.ipage.reflect.ValueConverter;
@@ -124,7 +125,17 @@ public final class SqlStatement {
          * @return 当前构建器
          */
         public Builder condition(SqlCondition condition) {
-            sql.append(condition.columnExpression()).append(' ').append(condition.operator().getSymbol());
+            // PostgreSQL 的 LIKE 区分大小写，MySQL 的默认排序规则不区分。
+            // 统一把 LIKE 两侧转成小写，保证「包含」筛选在任何数据库上行为一致。
+            boolean textMatch = condition.operator() == OperatorType.LIKE
+                                || condition.operator() == OperatorType.STARTS_WITH
+                                || condition.operator() == OperatorType.ENDS_WITH;
+            if (textMatch) {
+                sql.append("LOWER(").append(condition.columnExpression()).append(')');
+            } else {
+                sql.append(condition.columnExpression());
+            }
+            sql.append(' ').append(condition.operator().getSymbol());
             if (condition.isNullCheck()) {
                 return this;
             }
@@ -150,15 +161,15 @@ public final class SqlStatement {
             String raw = String.valueOf(condition.value());
             switch (condition.operator()) {
                 case LIKE -> {
-                    sql.append(" CONCAT('%', ?, '%')");
+                    sql.append(" LOWER(CONCAT('%', ?, '%'))");
                     parameters.add(ValueConverter.toDatabase(raw));
                 }
                 case STARTS_WITH -> {
-                    sql.append(" CONCAT(?, '%')");
+                    sql.append(" LOWER(CONCAT(?, '%'))");
                     parameters.add(ValueConverter.toDatabase(raw));
                 }
                 case ENDS_WITH -> {
-                    sql.append(" CONCAT('%', ?)");
+                    sql.append(" LOWER(CONCAT('%', ?))");
                     parameters.add(ValueConverter.toDatabase(raw));
                 }
                 default -> {

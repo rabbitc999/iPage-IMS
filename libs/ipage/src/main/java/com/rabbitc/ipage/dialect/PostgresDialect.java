@@ -43,6 +43,12 @@ public final class PostgresDialect implements Dialect {
     }
 
     @Override
+    public String textCast(String expression) {
+        // PostgreSQL 的 CHAR 不带长度等价于 CHAR(1)，会截断；TEXT 才是无长度文本。
+        return "CAST(" + expression + " AS TEXT)";
+    }
+
+    @Override
     public String limitClause(int limit, Integer offset) {
         return offset == null ? " LIMIT ?" : " LIMIT ? OFFSET ?";
     }

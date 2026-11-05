@@ -8,12 +8,13 @@
  * 列显隐与每页条数按用户保存到 {@code /api/views/{key}}，换账号不串数据。
  */
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { api, upload } from '../api/http'
 import { toast, toastError } from '../api/toast'
 import DataForm from '../components/DataForm.vue'
 
 const route = useRoute()
+const router = useRouter()
 const key = computed(() => route.params.key)
 
 const schema = ref(null)
@@ -22,6 +23,8 @@ const total = ref(0)
 const pages = ref(0)
 const page = ref(1)
 const size = ref(20)
+/** 当前账号在「列设置」里保存的每页条数；URL 没带 size 时用它。 */
+const viewSize = ref(20)
 const sort = ref('')
 const order = ref('desc')
 const kw = ref('')
@@ -83,11 +86,68 @@ const dialog = reactive({ open: false, mode: 'create', row: null, submitting: fa
 const fields = computed(() => schema.value?.fields || [])
 const tableFields = computed(() => fields.value.filter((field) => field.table))
 const visibleFields = computed(() => tableFields.value.filter((field) => !hidden.value.includes(field.name)))
-const filterFields = computed(() => fields.value.filter((field) => field.type !== 'ASSOCIATION_MODEL' && field.type !== 'AGGREGATION'))
+const filterFields = computed(() => fields.value.filter((field) =>
+  field.type !== 'ASSOCIATION_MODEL' && field.type !== 'AGGREGATION' && field.type !== 'MODEL_ID'))
 const canCreate = computed(() => schema.value?.permissions?.create)
 const canEdit = computed(() => schema.value?.permissions?.edit)
 const canDelete = computed(() => schema.value?.permissions?.delete)
 const allChecked = computed(() => rows.value.length > 0 && selected.value.length === rows.value.length)
+
+/** 按 Java 字段名取字段元数据；筛选行要靠它判断字段类型。 */
+function fieldMeta(name) {
+  return fields.value.find((field) => field.name === name)
+}
+
+/** 外键列存的是 UUID，只能从下拉里选具体记录。 */
+function isAssociation(name) {
+  return fieldMeta(name)?.type === 'ASSOCIATION_ID'
+}
+
+/** 枚举列存的是常量名（OPEN），界面要显示中文标签。 */
+function isEnum(name) {
+  return fieldMeta(name)?.type === 'ENUM'
+}
+
+/** 布尔列用「是/否」下拉，避免把「是」当成 false。 */
+function isBoolean(name) {
+  return fieldMeta(name)?.type === 'BOOLEAN'
+}
+
+/** 只有字符串列适合「包含/开头/结尾」；日期、数字、布尔都不该走 LIKE。 */
+function isFuzzy(name) {
+  return fieldMeta(name)?.type === 'STRING'
+}
+
+/** 外键、枚举、布尔都只能选、不能手打。 */
+function needsSelect(name) {
+  return isAssociation(name) || isEnum(name) || isBoolean(name)
+}
+
+function selectOptions(name) {
+  if (isBoolean(name)) return { true: '是', false: '否' }
+  return fieldMeta(name)?.options || {}
+}
+
+function defaultOperator(name) {
+  return isFuzzy(name) && !needsSelect(name) ? 'LIKE' : 'EQ'
+}
+
+/** 切换筛选字段时，把操作符和值调整成该字段能用的形态。 */
+function onFilterFieldChange(filter) {
+  filter.op = defaultOperator(filter.field)
+  filter.value = ''
+  search()
+}
+
+/** 地址栏里的旧条件可能带着不支持的 LIKE（例如日期列），还原时纠正掉。 */
+function normalizeFilterOp(filter) {
+  const meta = fieldMeta(filter.field)
+  if (!meta) return filter
+  if (!isFuzzy(meta.name) && ['LIKE', 'STARTS_WITH', 'ENDS_WITH'].includes(filter.op)) {
+    filter.op = 'EQ'
+  }
+  return filter
+}
 
 // ------------------------------------------------------------------ 查询参数
 
@@ -102,6 +162,16 @@ const allChecked = computed(() => rows.value.length > 0 && selected.value.length
 /** Transfers use the same authenticated API and filters as the list. */
 const transferFormat = ref('csv')
 const transferring = ref(false)
+/**
+ * 导出与「下载导入模板」共用的文件格式。
+ * <p>
+ * 只有两个取值，直接摊成两个按钮比裸 `<select>` 更清楚：
+ * 用户一眼能看出这个控件管的是「文件格式」，而不是某个按钮的附属品。
+ */
+const transferFormats = [
+  { value: 'csv', label: 'CSV' },
+  { value: 'xlsx', label: 'Excel' }
+]
 
 async function downloadTable(template = false) {
   const model = key.value
@@ -163,6 +233,99 @@ function params() {
   return result
 }
 
+// ------------------------------------------------------------------ URL 查询状态
+
+/**
+ * 搜索条件同步到 URL，浏览器前进/后退才能回到上一次查询。
+ * <p>
+ * 只把「有内容」的条件写进地址栏：空的搜索框、刚添加还没填值的筛选行不占 URL，
+ * 避免地址栏越用越长。筛选行用一段 JSON 保存，保留顺序与同一字段的多个条件。
+ */
+function stableQuery(query) {
+  return Object.keys(query)
+    .sort()
+    .map((name) => {
+      const value = query[name]
+      if (value === undefined || value === null) return ''
+      return `${name}=${Array.isArray(value) ? value.join(',') : String(value)}`
+    })
+    .filter(Boolean)
+    .join('&')
+}
+
+function positiveInt(value, fallback) {
+  const parsed = Number(value)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback
+}
+
+function parseUrlFilters(value) {
+  if (typeof value !== 'string' || !value) return []
+  try {
+    const parsed = JSON.parse(value)
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .filter((item) => item && typeof item.field === 'string' && typeof item.op === 'string')
+      .slice(0, 20)
+      .map((item) => ({
+        field: item.field,
+        op: item.op.toUpperCase(),
+        value: item.value === undefined || item.value === null ? '' : String(item.value)
+      }))
+  } catch (e) {
+    return []
+  }
+}
+
+function stateQuery() {
+  const query = {}
+  if (kw.value.trim()) query.kw = kw.value.trim()
+  const activeFilters = filters.value.filter((filter) => {
+    const unary = ['IS_NULL', 'IS_NOT_NULL'].includes(filter.op)
+    return filter.field && (unary || (filter.value !== '' && filter.value !== null && filter.value !== undefined))
+  })
+  if (activeFilters.length) query.filters = JSON.stringify(activeFilters)
+  if (page.value > 1) query.page = String(page.value)
+  if (size.value !== 20) query.size = String(size.value)
+  if (sort.value) {
+    query.sort = sort.value
+    query.order = order.value
+  }
+  if (key.value === 'ticket') {
+    for (const name of ['from', 'to', 'department']) {
+      if (typeof route.query[name] === 'string') query[name] = route.query[name]
+    }
+  }
+  return query
+}
+
+function applyQuery(query) {
+  kw.value = typeof query.kw === 'string' ? query.kw : ''
+  page.value = positiveInt(query.page, 1)
+  const requestedSize = positiveInt(query.size, 0)
+  size.value = requestedSize || viewSize.value || 20
+  sort.value = typeof query.sort === 'string' ? query.sort : ''
+  order.value = query.order === 'asc' ? 'asc' : 'desc'
+  const allowed = new Set(filterFields.value.map((field) => field.name))
+  filters.value = parseUrlFilters(query.filters)
+    .filter((filter) => allowed.has(filter.field))
+    .map(normalizeFilterOp)
+  pendingSize.value = size.value
+}
+
+/** 最近一次已经反映到界面上的查询，用来区分「自己 push」和「浏览器后退」。 */
+let appliedQuery = ''
+
+function syncQuery(mode = 'push') {
+  const query = stateQuery()
+  const serialized = stableQuery(query)
+  const current = stableQuery(route.query)
+  appliedQuery = serialized
+  if (current === serialized) return false
+  const navigate = mode === 'replace' ? router.replace : router.push
+  navigate({ query }).catch(() => {})
+  return true
+}
+
 // ------------------------------------------------------------------ 数据加载
 
 /**
@@ -185,7 +348,8 @@ async function loadView() {
     const result = await api(`/views/${key.value}`)
     const config = result.config || {}
     hidden.value = Array.isArray(config.hidden) ? config.hidden : []
-    size.value = Number(config.size) > 0 ? Number(config.size) : 20
+    viewSize.value = Number(config.size) > 0 ? Number(config.size) : 20
+    size.value = viewSize.value
     pendingSize.value = size.value
   } catch (e) {
     hidden.value = []
@@ -196,23 +360,38 @@ async function loadView() {
  * 拉取当前页数据。
  * <p>
  * 每次加载都清空勾选：翻页后还保留上一页的选中项，批量删除会误删看不见的行。
+ * 用递增的 loadVersion 丢弃过期响应：快速连续搜索时，先发的请求可能后到，
+ * 不能让旧结果覆盖新结果。
  */
+let loadVersion = 0
+
 async function loadRows() {
+  const version = ++loadVersion
   loading.value = true
   error.value = ''
   selected.value = []
   try {
     const result = await api(`/models/${key.value}`, { params: params() })
+    if (version !== loadVersion) return
     rows.value = result.rows
     total.value = result.total
     pages.value = result.pages
+    if (result.pages > 0 && result.page > result.pages) {
+      // 删到最后一页、或筛选后总页数变少：回到最后一页，别停在空页。
+      page.value = result.pages
+      syncQuery('replace')
+      await loadRows()
+      return
+    }
     page.value = result.page
   } catch (e) {
+    if (version !== loadVersion) return
     error.value = e.message
     rows.value = []
     total.value = 0
+    pages.value = 0
   } finally {
-    loading.value = false
+    if (version === loadVersion) loading.value = false
   }
 }
 
@@ -222,18 +401,23 @@ async function reload() {
 
 function search() {
   page.value = 1
+  syncQuery('push')
   loadRows()
 }
 
 function resetSearch() {
   kw.value = ''
   filters.value = []
+  sort.value = ''
+  order.value = 'desc'
   page.value = 1
+  syncQuery('push')
   loadRows()
 }
 
 function addFilter() {
-  filters.value.push({ field: filterFields.value[0]?.name || '', op: 'LIKE', value: '' })
+  const first = filterFields.value[0]
+  filters.value.push({ field: first?.name || '', op: defaultOperator(first?.name), value: '' })
 }
 
 function removeFilter(index) {
@@ -249,12 +433,15 @@ function sortBy(field) {
     sort.value = field.name
     order.value = 'asc'
   }
+  page.value = 1
+  syncQuery('push')
   loadRows()
 }
 
 function setPage(next) {
   if (next < 1 || (pages.value && next > pages.value)) return
   page.value = next
+  syncQuery('push')
   loadRows()
 }
 
@@ -371,6 +558,7 @@ async function saveColumns() {
     .filter((field) => !pendingVisible.value.includes(field.name))
     .map((field) => field.name)
   size.value = Number(pendingSize.value) || 20
+  viewSize.value = size.value
   columnDialog.value = false
   try {
     await api(`/views/${key.value}`, {
@@ -382,34 +570,55 @@ async function saveColumns() {
     toastError(e)
   }
   page.value = 1
+  syncQuery('push')
   await loadRows()
 }
 
 // ------------------------------------------------------------------ 启动
 
 /**
- * 首次进入：schema → 界面配置 → 数据，顺序不能换。
+ * 首次进入：schema → 界面配置 → 地址栏条件 → 数据，顺序不能换。
  * <p>
- * 后一步依赖前一步：没有 schema 就不知道哪些列在表格里，没有界面配置就不知道该隐藏谁。
+ * 后一步依赖前一步：没有 schema 就不知道哪些列在表格里、筛选字段是否合法；
+ * 没有界面配置就不知道该隐藏谁、默认每页多少条。
  */
 async function bootstrap() {
   try {
     await loadSchema()
     await loadView()
+    applyQuery(route.query)
+    appliedQuery = stableQuery(route.query)
     await loadRows()
   } catch (e) {
     error.value = e.message
   }
 }
 
-watch([key, () => route.query.from, () => route.query.to, () => route.query.department], () => {
+watch(key, () => {
   page.value = 1
   kw.value = ''
   filters.value = []
   sort.value = ''
   attachmentDialog.value = null
   schema.value = null
+  appliedQuery = ''
   bootstrap()
+})
+
+/**
+ * 浏览器前进/后退只改地址栏，不重新挂载组件；这里把地址栏条件还原成
+ * 界面状态并重新查询。自己 push 产生的变化已经由动作函数加载过，跳过。
+ * <p>
+ * 监听 {@code fullPath} 而不是 {@code route.query}：query 是对象，路由复用
+ * 同一个对象时浅层 watch 可能不触发；字符串路径每次导航都会变化。
+ */
+watch(() => route.fullPath, () => {
+  const query = route.query
+  const serialized = stableQuery(query)
+  if (serialized === appliedQuery) return
+  appliedQuery = serialized
+  applyQuery(query)
+  if (schema.value) loadRows()
 })
 
 onMounted(bootstrap)
@@ -447,10 +656,20 @@ onUnmounted(() => clearTimeout(hideTimer))
       <div class="row wrap">
         <button class="btn" @click="openColumns">列设置</button>
         <button class="btn" :disabled="loading" @click="reload">刷新</button>
-        <select v-model="transferFormat" aria-label="文件格式" :disabled="transferring">
-          <option value="csv">CSV</option>
-          <option value="xlsx">Excel (.xlsx)</option>
-        </select>
+        <div class="format-switch" role="group" aria-label="导出与导入模板格式"
+             title="导出与下载导入模板使用的文件格式">
+          <span class="format-label">格式</span>
+          <button
+            v-for="option in transferFormats"
+            :key="option.value"
+            type="button"
+            class="format-option"
+            :class="{ active: transferFormat === option.value }"
+            :aria-pressed="transferFormat === option.value"
+            :disabled="transferring"
+            @click="transferFormat = option.value"
+          >{{ option.label }}</button>
+        </div>
         <button class="btn" :disabled="transferring" @click="downloadTable()">导出</button>
         <button v-if="canCreate" class="btn" :disabled="transferring" @click="downloadTable(true)">下载导入模板</button>
         <button v-if="canCreate" class="btn" :disabled="transferring" @click="$refs.importFile.click()">导入</button>
@@ -472,27 +691,60 @@ onUnmounted(() => clearTimeout(hideTimer))
       </div>
 
       <div v-for="(filter, index) in filters" :key="index" class="row wrap filter-row">
-        <select v-model="filter.field" class="select tiny" @change="search">
+        <select v-model="filter.field" class="select tiny" @change="onFilterFieldChange(filter)">
           <option v-for="field in filterFields" :key="field.name" :value="field.name">{{ field.text }}</option>
         </select>
         <select v-model="filter.op" class="select tiny" @change="search">
-          <option value="LIKE">包含</option>
-          <option value="EQ">等于</option>
-          <option value="NE">不等于</option>
-          <option value="GT">大于</option>
-          <option value="LT">小于</option>
-          <option value="GTE">不小于</option>
-          <option value="LTE">不大于</option>
-          <option value="IS_NULL">为空</option>
-          <option value="IS_NOT_NULL">不为空</option>
+          <template v-if="needsSelect(filter.field)">
+            <option value="EQ">等于</option>
+            <option value="NE">不等于</option>
+            <option value="IS_NULL">为空</option>
+            <option value="IS_NOT_NULL">不为空</option>
+          </template>
+          <template v-else-if="isFuzzy(filter.field)">
+            <option value="LIKE">包含</option>
+            <option value="EQ">等于</option>
+            <option value="NE">不等于</option>
+            <option value="GT">大于</option>
+            <option value="LT">小于</option>
+            <option value="GTE">不小于</option>
+            <option value="LTE">不大于</option>
+            <option value="IS_NULL">为空</option>
+            <option value="IS_NOT_NULL">不为空</option>
+          </template>
+          <template v-else>
+            <option value="EQ">等于</option>
+            <option value="NE">不等于</option>
+            <option value="GT">大于</option>
+            <option value="LT">小于</option>
+            <option value="GTE">不小于</option>
+            <option value="LTE">不大于</option>
+            <option value="IS_NULL">为空</option>
+            <option value="IS_NOT_NULL">不为空</option>
+          </template>
         </select>
-        <input
-          v-if="filter.op !== 'IS_NULL' && filter.op !== 'IS_NOT_NULL'"
-          v-model="filter.value"
-          class="input tiny"
-          placeholder="值"
-          @keyup.enter="search"
-        />
+        <template v-if="filter.op !== 'IS_NULL' && filter.op !== 'IS_NOT_NULL'">
+          <select
+            v-if="needsSelect(filter.field)"
+            v-model="filter.value"
+            class="select tiny wide"
+            @change="search"
+          >
+            <option value="">全部</option>
+            <option
+              v-for="(label, value) in selectOptions(filter.field)"
+              :key="value"
+              :value="value"
+            >{{ label }}</option>
+          </select>
+          <input
+            v-else
+            v-model="filter.value"
+            class="input tiny"
+            placeholder="值"
+            @keyup.enter="search"
+          />
+        </template>
         <button class="btn ghost sm" @click="removeFilter(index)">移除</button>
       </div>
     </div>
@@ -636,6 +888,45 @@ onUnmounted(() => clearTimeout(hideTimer))
 .filter-row { margin-top: 10px; }
 .tiny { height: 30px; width: auto; min-width: 110px; }
 .select.tiny { min-width: 130px; }
+
+/* 格式切换：与 34px 高的按钮同高，和「导出 / 下载导入模板」视觉上连成一组 */
+.format-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 34px;
+  padding: 0 4px 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  user-select: none;
+}
+.format-label { margin-right: 4px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.format-option {
+  height: 26px;
+  min-width: 56px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: 0.15s ease;
+  white-space: nowrap;
+}
+.format-option:hover:not(:disabled) { color: var(--text); }
+.format-option.active {
+  border-color: var(--border-strong);
+  background: var(--panel);
+  color: var(--primary);
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+.format-option:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+.format-option:disabled { opacity: 0.55; cursor: not-allowed; }
 .table-card { overflow: hidden; }
 .pager { display: flex; align-items: center; gap: 8px; padding: 12px 14px; border-top: 1px solid var(--border); }
 .error-card { padding: 18px; color: var(--danger); background: var(--danger-weak); border-color: transparent; }

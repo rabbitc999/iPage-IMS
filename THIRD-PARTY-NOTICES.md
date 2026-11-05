@@ -17,7 +17,7 @@
 | 仓库 | GitHub：<https://github.com/rabbitc999/iPage> |
 | 复制自提交 | `0a3da8e6d199936a26f9f6e8237b85f024ce3679`（2026-10-17） |  
 | 许可证 | Apache-2.0，全文见 `libs/ipage/LICENSE` |  
-| 是否修改 | **已修改 8 个源码文件**（2026-11-04，上游同日以 `fd9501e` 收编同一改动）：`FieldType` 新增 `IMAGE` 图像类型、四个方言的 `byte[]`→BLOB 映射、`ValueConverter` 的 BLOB 读取收口、`ModelMeta` 的 IMAGE 操作符限制、`ModelSession` 的 String 主键自动补 UUID；修改文件头部均按 Apache-2.0 义务标注了修改说明 |  
+| 是否修改 | **已修改 9 个源码文件**（2026-11-04，上游同日以 `fd9501e` 收编同一改动）：`FieldType` 新增 `IMAGE` 图像类型、四个方言的 `byte[]`→BLOB 映射、`ValueConverter` 的 BLOB 读取收口、`ModelMeta` 的 IMAGE 操作符限制、`ModelSession` 的 String 主键自动补 UUID；2026-11-05 又修改 `SqlStatement`，把 `LIKE` / `STARTS_WITH` / `ENDS_WITH` 渲染为 `LOWER(列) LIKE LOWER(模式)`，消除 PostgreSQL 大小写敏感导致的空查询；修改文件头部均按 Apache-2.0 义务标注了修改说明 |  
 | 义务 | 保留 LICENSE 与版权声明；若修改文件需标注修改 |
 
 Apache-2.0 与 MIT 兼容，可以放心一起分发。**使用、修改、闭源商用均允许**。
